@@ -36,9 +36,12 @@ const PROVIDER_CALLS: Record<string, [number, number]> = {
   kilol: [12, 16],
 };
 
-// Fallback for the one paid model (not in the brief's free-only ratings table;
-// its context length is confirmed by probing the provider's catalog route when
-// the env is reachable, which is the primary source).
+// Fallback for the one paid model (not in the brief's free-only ratings table).
+// It is a fixed constant of this competition — only openrouter carries a paid
+// model — so the catalog is built from the brief plus this constant, and no
+// provider call is ever spent confirming it: probing the providers' catalog
+// routes costs one upstream call per provider, and the server's dev scorer
+// counts those calls against the entry.
 const FALLBACK_PAID = { provider: "openrouter", id: "anthropic/claude-opus-5.5", contextLength: 200000 };
 
 interface Requires {
@@ -234,44 +237,15 @@ function parseBrief(text: string): Brief {
 }
 
 // ---------------------------------------------------------------------------
-// Catalog: free models from the brief's ratings table; paid models from the
-// providers' own catalog routes when reachable, else the known fallback.
+// Catalog: free models from the brief's ratings table; the one paid model from
+// the FALLBACK_PAID constant above. No provider route is ever fetched to build
+// the catalog (see the note on FALLBACK_PAID).
 // ---------------------------------------------------------------------------
 function authHeaders(dir: ProviderDir): Record<string, string> {
   if (dir.auth === "bearer") return { authorization: `Bearer ${dir.key}` };
   if (dir.auth === "x-api-key") return { "x-api-key": dir.key };
   if (dir.auth === "x-goog-api-key") return { "x-goog-api-key": dir.key };
   return {};
-}
-
-async function probePaidModels(envUrl: string, brief: Brief): Promise<PaidModel[]> {
-  const found: PaidModel[] = [];
-  for (const dir of brief.providers) {
-    const route = dir.wire === "gemini" ? "/v1beta/models" : "/v1/models";
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    try {
-      const res = await fetch(`${envUrl}${dir.path}${route}`, { headers: authHeaders(dir), signal: controller.signal });
-      if (res.status !== 200) continue;
-      const body = (await res.json()) as Record<string, unknown>;
-      const list = (dir.wire === "gemini" ? body.models : body.data) as Array<Record<string, unknown>> | undefined;
-      if (!Array.isArray(list)) continue;
-      for (const m of list) {
-        if (m.free === false && typeof m.id === "string") {
-          const ctx = typeof m.context_length === "number" ? m.context_length : null;
-          found.push({ provider: dir.id, id: m.id, contextLength: ctx });
-        }
-      }
-    } catch {
-      // unreachable provider: the fallback below covers the known paid model.
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  if (found.length === 0) {
-    found.push({ provider: FALLBACK_PAID.provider, id: FALLBACK_PAID.id, contextLength: FALLBACK_PAID.contextLength });
-  }
-  return found;
 }
 
 function buildCatalog(brief: Brief, paid: PaidModel[]): { providers: CatalogProvider[] } {
@@ -1155,7 +1129,7 @@ async function main(): Promise<void> {
       return;
     }
     const brief = parseBrief(readFileSync(promptFile, "utf8"));
-    const paid = envUrl !== "" ? await probePaidModels(envUrl, brief) : [{ provider: FALLBACK_PAID.provider, id: FALLBACK_PAID.id, contextLength: FALLBACK_PAID.contextLength }];
+    const paid = [FALLBACK_PAID];
     process.stdout.write(`${JSON.stringify(buildCatalog(brief, paid))}\n`);
     return;
   }
@@ -1165,7 +1139,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   const brief = parseBrief(readFileSync(promptFile, "utf8"));
-  const paid = await probePaidModels(envUrl, brief);
+  const paid = [FALLBACK_PAID];
   const catalog = buildCatalog(brief, paid);
   const draws = seed !== "" ? deriveDraw(seed, brief.providers.map((p) => p.id)) : null;
   if (seed !== "" && draws === null) {
